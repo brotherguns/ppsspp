@@ -673,6 +673,12 @@ int main(int argc, char *argv[]) {
 
 	g_logManager.EnableOutput(LogOutput::Stdio);
 
+#if !PPSSPP_PLATFORM(IOS_APP_STORE)
+	// Make the brk-based debugger-assisted JIT "syscalls" safe when no debugger is
+	// attached (iOS 26 TXM devices). Without this they would crash the process.
+	InstallDebuggerAssistedJITTrapHandler();
+#endif
+
 #if PPSSPP_PLATFORM(IOS_APP_STORE)
 	g_jitAvailable = false;
 #else
@@ -709,6 +715,21 @@ int main(int argc, char *argv[]) {
 		g_jitAvailable = true;
 	}
 */
+
+	// On iOS 26 TXM devices, check whether a JIT-enabler debugger (StikDebug/StikJIT with
+	// universal.js, JitStreamer EB, etc.) is currently attached and able to serve us
+	// executable memory. If so, the JITs will use debugger-assisted dual-mapped JIT memory.
+	{
+		void *probeWritable = nullptr;
+		void *probeExec = AllocateDualMappedExecutableMemory(64 * 1024, &probeWritable);
+		if (probeExec) {
+			INFO_LOG(Log::System, "JIT: debugger-assisted dual-mapped JIT available (exec %p, writable %p)", probeExec, probeWritable);
+			g_jitAvailable = true;
+			FreeDualMappedExecutableMemory(probeExec, probeWritable, 64 * 1024);
+		} else {
+			INFO_LOG(Log::System, "JIT: debugger-assisted dual-mapped JIT unavailable - attach StikDebug/StikJIT to this app before starting a game to enable it on iOS 26");
+		}
+	}
 #endif
 
 	// Ignore sigpipe.

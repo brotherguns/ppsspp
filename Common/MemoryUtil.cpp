@@ -38,11 +38,18 @@
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/mman.h>
-#include <mach/vm_param.h>
+#include <mach/mach.h>
+#include <sys/ucontext.h>
 #endif
 
 #ifndef _WIN32
 #include <unistd.h>
+#endif
+
+#if PPSSPP_HAS_DEBUGGER_ASSISTED_JIT
+#include <csignal>
+#include <mutex>
+#include <vector>
 #endif
 static int hint_location;
 #ifdef __APPLE__
@@ -214,6 +221,154 @@ void *AllocateExecutableMemory(size_t size) {
 
 #endif  // non-windows
 
+#if PPSSPP_HAS_DEBUGGER_ASSISTED_JIT
+
+// Breakpoint-based "syscalls" for JIT on iOS 26 devices with TXM, handled by an attached
+// debugger such as StikDebug/StikJIT (universal.js), JitStreamer EB or TrollStore's
+// apple-magnifier JIT enabler:
+//
+//   x16 = 1, brk #0xf00d : PrepareRegion(addr, len). The debugger allocates a read+execute
+//                          region of len bytes (at addr, or a fresh one when addr is zero),
+//                          prepares its pages, and returns the address in x0.
+//   x16 = 0, brk #0xf00d : Detach.
+__attribute__((naked)) static void *IOS26JITPrepareRegion(void *addr, size_t len) {
+	__asm__ volatile(
+		"mov x16, #1\n"
+		"brk #0xf00d\n"
+		"ret\n");
+}
+
+// If no debugger is attached to service the breakpoint, SIGTRAP would kill the process.
+// Skip past the brk and make the "syscall" return zero so callers can fall back.
+static void IOS26JITTrapHandler(int signum, siginfo_t *info, void *context) {
+	ucontext_t *uc = (ucontext_t *)context;
+	if (!uc) {
+		return;
+	}
+	uc->uc_mcontext->__ss.__pc += 4;
+	uc->uc_mcontext->__ss.__x[0] = 0;
+}
+
+void InstallDebuggerAssistedJITTrapHandler() {
+	struct sigaction sa{};
+	sa.__sigaction_u.__sa_sigaction = &IOS26JITTrapHandler;
+	sa.sa_flags = SA_SIGINFO | SA_RESTART;
+	sigaction(SIGTRAP, &sa, nullptr);
+}
+
+struct DualMappedJITRange {
+	uintptr_t execStart;
+	uintptr_t writeStart;
+	size_t size;
+};
+
+static std::vector<DualMappedJITRange> dualMappedRanges;
+static std::mutex dualMappedMutex;
+
+bool PlatformIsDualMappedJIT() {
+	std::lock_guard<std::mutex> guard(dualMappedMutex);
+	return !dualMappedRanges.empty();
+}
+
+static bool InDualMappedJITRange(uintptr_t addr) {
+	std::lock_guard<std::mutex> guard(dualMappedMutex);
+	for (const DualMappedJITRange &range : dualMappedRanges) {
+		if ((addr >= range.execStart && addr < range.execStart + range.size) ||
+			(addr >= range.writeStart && addr < range.writeStart + range.size)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void *AllocateDualMappedExecutableMemory(size_t size, void **writablePtr) {
+	*writablePtr = nullptr;
+
+	static std::once_flag installOnce;
+	std::call_once(installOnce, [] {
+		InstallDebuggerAssistedJITTrapHandler();
+	});
+
+	// The debugger-side allocator works in 16KB pages.
+	const size_t jitPageSize = 16384;
+	size = (size + jitPageSize - 1) & ~(jitPageSize - 1);
+
+	uintptr_t exec = (uintptr_t)IOS26JITPrepareRegion(nullptr, size);
+	if (exec == 0) {
+		WARN_LOG(Log::JIT, "Debugger-assisted JIT: no JIT-enabler debugger attached, allocation of %d bytes failed", (int)size);
+		return nullptr;
+	}
+
+	vm_address_t writeAddr = 0;
+	vm_prot_t curProt = 0, maxProt = 0;
+	kern_return_t kr = vm_remap(mach_task_self(), &writeAddr, size, 0, VM_FLAGS_ANYWHERE,
+								mach_task_self(), exec, false, &curProt, &maxProt, VM_INHERIT_NONE);
+	if (kr != KERN_SUCCESS) {
+		ERROR_LOG(Log::JIT, "Debugger-assisted JIT: vm_remap failed: %d", (int)kr);
+		vm_deallocate(mach_task_self(), exec, size);
+		return nullptr;
+	}
+	kr = vm_protect(mach_task_self(), writeAddr, size, false, VM_PROT_READ | VM_PROT_WRITE);
+	if (kr != KERN_SUCCESS) {
+		ERROR_LOG(Log::JIT, "Debugger-assisted JIT: vm_protect failed: %d", (int)kr);
+		vm_deallocate(mach_task_self(), writeAddr, size);
+		vm_deallocate(mach_task_self(), exec, size);
+		return nullptr;
+	}
+
+	{
+		std::lock_guard<std::mutex> guard(dualMappedMutex);
+		dualMappedRanges.push_back({exec, (uintptr_t)writeAddr, size});
+	}
+
+	INFO_LOG(Log::JIT, "Debugger-assisted JIT: allocated %d bytes, exec at %p, writable at %p",
+		(int)size, (void *)exec, (void *)writeAddr);
+
+	*writablePtr = (void *)writeAddr;
+	return (void *)exec;
+}
+
+void FreeDualMappedExecutableMemory(void *ptr, void *writablePtr, size_t size) {
+	if (!ptr) {
+		return;
+	}
+
+	const size_t jitPageSize = 16384;
+	size = (size + jitPageSize - 1) & ~(jitPageSize - 1);
+
+	{
+		std::lock_guard<std::mutex> guard(dualMappedMutex);
+		for (size_t i = 0; i < dualMappedRanges.size(); i++) {
+			if (dualMappedRanges[i].execStart == (uintptr_t)ptr) {
+				dualMappedRanges.erase(dualMappedRanges.begin() + i);
+				break;
+			}
+		}
+	}
+
+	vm_deallocate(mach_task_self(), (vm_address_t)ptr, size);
+	if (writablePtr) {
+		vm_deallocate(mach_task_self(), (vm_address_t)writablePtr, size);
+	}
+}
+
+#else  // !PPSSPP_HAS_DEBUGGER_ASSISTED_JIT
+
+bool PlatformIsDualMappedJIT() {
+	return false;
+}
+
+void InstallDebuggerAssistedJITTrapHandler() {}
+
+void *AllocateDualMappedExecutableMemory(size_t size, void **writablePtr) {
+	*writablePtr = nullptr;
+	return nullptr;
+}
+
+void FreeDualMappedExecutableMemory(void *ptr, void *writablePtr, size_t size) {}
+
+#endif  // PPSSPP_HAS_DEBUGGER_ASSISTED_JIT
+
 void *AllocateMemoryPages(size_t size, uint32_t memProtFlags) {
 #ifdef _WIN32
 	if (sys_info.dwPageSize == 0)
@@ -338,6 +493,14 @@ bool ProtectMemoryPages(const void* ptr, size_t size, uint32_t memProtFlags) {
 	uintptr_t end = (uintptr_t)ptr + size;
 	start &= ~(page_size - 1);
 	end = (end + page_size - 1) & ~(page_size - 1);
+#if PPSSPP_HAS_DEBUGGER_ASSISTED_JIT
+	// Debugger-assisted dual-mapped JIT memory is permanently protected: writes always go
+	// through the writable alias and execution through the executable mapping, so there's
+	// nothing to change here.
+	if (InDualMappedJITRange(start)) {
+		return true;
+	}
+#endif
 	int retval = mprotect((void *)start, end - start, protect);
 	if (retval != 0) {
 		ERROR_LOG(Log::MemMap, "mprotect failed (%p)! errno=%d (%s)", (void *)start, errno, strerror(errno));

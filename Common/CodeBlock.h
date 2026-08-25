@@ -80,6 +80,18 @@ public:
 		region = (u8 *)jitController.rx_addr;
 		writableRegion = (u8 *)jitController.rw_addr;
 #else // PPSSPP_PLATFORM(SWITCH)
+#if PPSSPP_HAS_DEBUGGER_ASSISTED_JIT
+		// On iOS 26 TXM devices, first try to get executable memory from an attached JIT-enabler
+		// debugger (StikDebug/StikJIT etc.), aliased to a permanently writable mapping. If no
+		// debugger is attached, fall back to the classic allocation (which needs JIT entitlements).
+		void *writable = nullptr;
+		region = (u8 *)AllocateDualMappedExecutableMemory(region_size, &writable);
+		writableRegion = (u8 *)writable;
+		if (region) {
+			T::SetCodePointer(region, writableRegion);
+			return;
+		}
+#endif
 		// The protection will be set to RW if PlatformIsWXExclusive.
 		region = (u8 *)AllocateExecutableMemory(region_size);
 		writableRegion = region;
@@ -152,8 +164,14 @@ public:
 	// Call this when shutting down. Don't rely on the destructor, even though it'll do the job.
 	void FreeCodeSpace() {
 #if !PPSSPP_PLATFORM(SWITCH)
-		ProtectMemoryPages(region, region_size, MEM_PROT_READ | MEM_PROT_WRITE);
-		FreeExecutableMemory(region, region_size);
+		if (region && writableRegion != region) {
+			// Dual-mapped allocation from debugger-assisted JIT (iOS 26). The writable side
+			// is permanently writable, no need to reprotect before freeing.
+			FreeDualMappedExecutableMemory(region, writableRegion, region_size);
+		} else {
+			ProtectMemoryPages(region, region_size, MEM_PROT_READ | MEM_PROT_WRITE);
+			FreeExecutableMemory(region, region_size);
+		}
 #else // !PPSSPP_PLATFORM(SWITCH)
 		jitClose(&jitController);
 		printf("[NXJIT]: Jit closed\n");

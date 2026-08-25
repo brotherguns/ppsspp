@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "ppsspp_config.h"
+
 #ifndef _WIN32
 #ifndef __SWITCH__
 #include <sys/mman.h>
@@ -26,8 +28,43 @@
 #endif
 #include <stdint.h>
 
+// Defined to 1 on platforms where executable memory must be obtained from an attached
+// debugger as a pair of mappings (one executable, one writable) instead of being
+// reprotected in-process. Currently iOS 26 devices with TXM only.
+#if PPSSPP_PLATFORM(IOS) && !PPSSPP_PLATFORM(IOS_SIMULATOR) && PPSSPP_ARCH(ARM64)
+#define PPSSPP_HAS_DEBUGGER_ASSISTED_JIT 1
+#else
+#define PPSSPP_HAS_DEBUGGER_ASSISTED_JIT 0
+#endif
+
 // Returns true if we need to avoid setting both writable and executable at the same time (W^X)
 bool PlatformIsWXExclusive();
+
+// Debugger-assisted JIT memory, for iOS 26 devices with TXM (Trusted Execution Monitor),
+// where W^X pages cannot be created in-process at all. An external "JIT enabler" app
+// (StikDebug/StikJIT running universal.js, JitStreamer EB, TrollStore's magnifier, etc.)
+// attaches a debugger to us; we then ask it to allocate read+execute memory by executing
+// a brk-based "syscall" (compatible with StikDebug's universal.js script), and alias the
+// result to a writable mapping with vm_remap.
+//
+// On success, AllocateDualMappedExecutableMemory returns the executable pointer and sets
+// *writablePtr to the writable alias of the exact same memory. Generate code by writing
+// through the writable pointer, and execute it through the returned pointer. While any
+// such allocation is active, ProtectMemoryPages() silently ignores pages belonging to
+// these mappings (both sides are permanently protected).
+//
+// Returns nullptr if no debugger is attached (or the feature is unsupported), in which
+// case callers should fall back to AllocateExecutableMemory as usual.
+void *AllocateDualMappedExecutableMemory(size_t size, void **writablePtr);
+void FreeDualMappedExecutableMemory(void *ptr, void *writablePtr, size_t size);
+
+// True while any debugger-assisted dual-mapped JIT memory is active.
+bool PlatformIsDualMappedJIT();
+
+// Makes the brk-based "syscalls" safe when no debugger is attached: the resulting SIGTRAP
+// is caught, skipped past, and treated as a failed allocation instead of a crash.
+// Call early at startup on iOS. Does nothing on unsupported platforms.
+void InstallDebuggerAssistedJITTrapHandler();
 
 #define MEM_PROT_READ  1
 #define MEM_PROT_WRITE 2

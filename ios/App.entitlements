@@ -2,5 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Required so JIT-enabler apps (StikDebug/StikJIT, JitStreamer EB, ...) can attach
+	     a debugger to PPSSPP and service the brk-based JIT "syscalls" on iOS 26. -->
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
 </dict>
 </plist>
