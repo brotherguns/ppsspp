@@ -4364,4 +4364,15 @@ void ARM64CodeBlock::PoisonMemory(int offset) {
 		*ptr++ = 0xD4200000;
 }
 
+void ARM64CodeBlock::PoisonMemoryRange(int offset, int end) {
+	// Poison only the used part of the space - see CodeBlock::ClearCodeSpace().
+	ptrdiff_t writable = m_writable - m_code;
+
+	u32 *ptr = (u32 *)(region + offset + writable);
+	u32 *maxptr = (u32 *)(region + end + writable);
+	// AArch64: 0xD4200000 = BRK 0
+	while (ptr < maxptr)
+		*ptr++ = 0xD4200000;
+}
+
 }  // namespace

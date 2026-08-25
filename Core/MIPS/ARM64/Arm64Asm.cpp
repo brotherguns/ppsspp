@@ -195,7 +195,10 @@ void Arm64Jit::GenerateFixedCode(const JitOptions &jo) {
 	// Fixed registers, these are always kept when in Jit context.
 	MOVP2R(MEMBASEREG, Memory::base);
 	MOVP2R(CTXREG, mips_);
-	MOVP2R(JITBASEREG, GetBasePtr());
+	// Pre-bias by the emuhack opcode so the dispatch fetch doesn't need to mask
+	// the opcode out of the block pointer (the top bits cancel in the ADD below),
+	// matching the IR backend's dispatcher.
+	MOVP2R(JITBASEREG, GetBasePtr() - MIPS_EMUHACK_OPCODE);
 
 	LoadStaticRegisters();
 	MovFromPC(SCRATCH1);
@@ -253,7 +256,7 @@ void Arm64Jit::GenerateFixedCode(const JitOptions &jo) {
 			dispatcherFetch = GetCodePtr();
 			LDR(SCRATCH1, MEMBASEREG, SCRATCH1_64);
 			LSR(SCRATCH2, SCRATCH1, 24);   // or UBFX(SCRATCH2, SCRATCH1, 24, 8)
-			ANDI2R(SCRATCH1, SCRATCH1, 0x00FFFFFF);
+			// No need to mask SCRATCH1 - the emuhack opcode is pre-biased into JITBASEREG.
 			CMP(SCRATCH2, MIPS_EMUHACK_OPCODE >> 24);
 			FixupBranch skipJump = B(CC_NEQ);
 				ADD(SCRATCH1_64, JITBASEREG, SCRATCH1_64);

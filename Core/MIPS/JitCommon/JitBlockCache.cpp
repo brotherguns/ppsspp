@@ -122,6 +122,12 @@ int JitBlockCache::AllocateBlock(u32 startAddress) {
 
 	b.invalid = false;
 	b.originalAddress = startAddress;
+	// Slots are recycled, so these must not keep values from a previous generation -
+	// a stale checkedEntry would make DestroyBlock patch code owned by another block.
+	b.checkedEntry = nullptr;
+	b.normalEntry = nullptr;
+	b.codeSize = 0;
+	b.originalSize = 0;
 	for (int i = 0; i < MAX_JIT_BLOCK_EXITS; ++i) {
 		b.exitAddress[i] = INVALID_EXIT;
 		b.exitPtrs[i] = 0;
@@ -443,7 +449,10 @@ void JitBlockCache::DestroyBlock(int block_num, DestroyType type) {
 			MIPSComp::jit->UnlinkBlock(writableEntry, b->originalAddress);
 		}
 	} else {
-		ERROR_LOG(Log::JIT, "Unlinking block with no entry: %08x (%d)", b->originalAddress, block_num);
+		// Expected whenever block linking is off - not an error, and CLEAR never unlinks anyway.
+		if (type != DestroyType::CLEAR) {
+			DEBUG_LOG(Log::JIT, "Unlinking block with no entry: %08x (%d)", b->originalAddress, block_num);
+		}
 	}
 }
 

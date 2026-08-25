@@ -43,12 +43,21 @@ public:
 	virtual const u8 *GetCodePtrFromWritablePtr(u8 *ptr) = 0;
 	virtual u8 *GetWritablePtrFromCodePtr(const u8 *ptr) = 0;
 
+	// Highest offset ever emitted into this code space since the last clear.
+	// Used to scope cache-clear work (poisoning, icache flushing) to the memory
+	// that has actually been used - everything past it still holds poison from
+	// the previous clear.
+	size_t GetUsedCodeSpace() const {
+		return highWater_;
+	}
+
 protected:
 	virtual void SetCodePtr(u8 *ptr) = 0;
 
 	// Note: this should be the readable/executable side if writable is a different pointer.
 	u8 *region = nullptr;
 	size_t region_size = 0;
+	size_t highWater_ = 0;
 };
 
 template<class T> class CodeBlock : public CodeBlockCommon, public T {
@@ -59,6 +68,18 @@ private:
 	// A privately used function to set the executable RAM space to something invalid.
 	// For debugging usefulness it should be used to set the RAM to a host specific breakpoint instruction
 	virtual void PoisonMemory(int offset) = 0;
+	// Poison only [offset, end) instead of the whole space. Backends that don't override
+	// this fall back to the legacy whole-space poison.
+	virtual void PoisonMemoryRange(int offset, int end) {
+		PoisonMemory(offset);
+	}
+
+	// True when W^X protection flips are actually required. With debugger-assisted
+	// dual-mapped JIT memory (iOS 26), both mappings are permanently protected and
+	// ProtectMemoryPages would be a guaranteed no-op, so skip the calls entirely.
+	bool WXFlipsActive() const {
+		return PlatformIsWXExclusive() && !PlatformIsDualMappedJIT();
+	}
 
 public:
 	CodeBlock() {}
@@ -105,13 +126,22 @@ public:
 		if (!region) {
 			return;
 		}
-		if (PlatformIsWXExclusive()) {
+		if (WXFlipsActive()) {
 			ProtectMemoryPages(region, region_size, MEM_PROT_READ | MEM_PROT_WRITE);
 		}
-		// If not WX Exclusive, no need to call ProtectMemoryPages because we never change the protection from RWX.
-		PoisonMemory(offset);
+		// Only re-poison the space actually used since the last clear; everything past
+		// the high-water mark still holds poison from before. If nothing was recorded
+		// yet (very first clear, or nothing compiled since the last one), fall back to
+		// poisoning everything - anonymous memory is zero-filled, and zero is not a
+		// trap instruction on most architectures.
+		size_t usedEnd = highWater_;
+		if (usedEnd <= (size_t)offset || usedEnd > region_size) {
+			usedEnd = region_size;
+		}
+		PoisonMemoryRange(offset, (int)usedEnd);
+		highWater_ = offset;
 		ResetCodePtr(offset);
-		if (PlatformIsWXExclusive() && offset != 0) {
+		if (WXFlipsActive() && offset != 0) {
 			// Need to re-protect the part we didn't clear.
 			ProtectMemoryPages(region, offset, MEM_PROT_READ | MEM_PROT_EXEC);
 		}
@@ -124,7 +154,7 @@ public:
 		_dbg_assert_msg_(!writeStart_, "Can't nest BeginWrite calls");
 
 		// In case the last block made the current page exec/no-write, let's fix that.
-		if (PlatformIsWXExclusive()) {
+		if (WXFlipsActive()) {
 			writeStart_ = GetCodePtr();
 			if (writeStart_ + sizeEstimate - region > (ptrdiff_t)region_size)
 				sizeEstimate = region_size - (writeStart_ - region);
@@ -136,7 +166,7 @@ public:
 	// In case you now know your original estimate is wrong.
 	void ContinueWrite(size_t sizeEstimate = 1) {
 		_dbg_assert_msg_(writeStart_, "Must have already called BeginWrite()");
-		if (PlatformIsWXExclusive()) {
+		if (WXFlipsActive()) {
 			const uint8_t *pos = GetCodePtr();
 			if (pos + sizeEstimate - region > (ptrdiff_t)region_size)
 				sizeEstimate = region_size - (pos - region);
@@ -146,8 +176,13 @@ public:
 	}
 
 	void EndWrite() {
+		// Track the highest offset we've emitted to, used to scope ClearCodeSpace().
+		size_t used = GetCodePtr() - region;
+		if (used > highWater_) {
+			highWater_ = used;
+		}
 		// OK, we're done. Re-protect the memory we touched.
-		if (PlatformIsWXExclusive() && writeStart_ != nullptr) {
+		if (WXFlipsActive() && writeStart_ != nullptr) {
 			const uint8_t *end = GetCodePtr();
 			size_t sz = end - writeStart_;
 			if (sz > writeEstimated_)
@@ -179,6 +214,7 @@ public:
 		region = nullptr;
 		writableRegion = nullptr;
 		region_size = 0;
+		highWater_ = 0;
 	}
 
 	const u8 *GetCodePtr() const override {

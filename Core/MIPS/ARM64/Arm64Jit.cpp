@@ -193,9 +193,15 @@ void Arm64Jit::FlushPrefixV() {
 
 void Arm64Jit::ClearCache() {
 	INFO_LOG(Log::JIT, "ARM64Jit: Clearing the cache!");
+	// Only flush the part of the space that was actually used since the last clear -
+	// the rest still holds already-flushed poison.
+	int usedEnd = (int)GetUsedCodeSpace();
+	if (usedEnd < jitStartOffset || usedEnd > (int)region_size) {
+		usedEnd = (int)region_size;
+	}
 	blocks.Clear();
 	ClearCodeSpace(jitStartOffset);
-	FlushIcacheSection(region + jitStartOffset, region + region_size - jitStartOffset);
+	FlushIcacheSection(region + jitStartOffset, region + usedEnd - jitStartOffset);
 }
 
 void Arm64Jit::InvalidateCacheAt(u32 em_address, int length) {
@@ -334,9 +340,12 @@ void Arm64Jit::DoJit(u32 em_address, JitBlock *b) {
 		b->checkedEntry = GetCodePtr();
 		bail = B(CC_LT);
 	} else if (jo.enableBlocklink) {
+		// Fast path: while there's still downcount left, fall straight into the block.
+		// The MOVI2R of the block start PC only executes on the slow path (downcount
+		// expired), matching the IR backend's block headers.
 		b->checkedEntry = GetCodePtr();
+		FixupBranch skip = TBZ(DOWNCOUNTREG, 31);
 		MOVI2R(SCRATCH1, js.blockStart);
-		FixupBranch skip = B(CC_GE);
 		B((const void *)outerLoopPCInSCRATCH1);
 		SetJumpTarget(skip);
 	} else {
@@ -456,14 +465,14 @@ void Arm64Jit::Comp_RunBlock(MIPSOpcode op) {
 }
 
 void Arm64Jit::LinkBlock(u8 *exitPoint, const u8 *checkedEntry) {
-	if (PlatformIsWXExclusive()) {
+	if (PlatformIsWXExclusive() && !PlatformIsDualMappedJIT()) {
 		ProtectMemoryPages(exitPoint, 32, MEM_PROT_READ | MEM_PROT_WRITE);
 	}
 	ARM64XEmitter emit(GetCodePtrFromWritablePtr(exitPoint), exitPoint);
 	emit.B(checkedEntry);
 	// TODO: Write stuff after, convering up the now-unused instructions.
 	emit.FlushIcache();
-	if (PlatformIsWXExclusive()) {
+	if (PlatformIsWXExclusive() && !PlatformIsDualMappedJIT()) {
 		ProtectMemoryPages(exitPoint, 32, MEM_PROT_READ | MEM_PROT_EXEC);
 	}
 }
@@ -472,7 +481,7 @@ void Arm64Jit::UnlinkBlock(u8 *checkedEntry, u32 originalAddress) {
 	// Send anyone who tries to run this block back to the dispatcher.
 	// Not entirely ideal, but .. works.
 	// Spurious entrances from previously linked blocks can only come through checkedEntry
-	if (PlatformIsWXExclusive()) {
+	if (PlatformIsWXExclusive() && !PlatformIsDualMappedJIT()) {
 		ProtectMemoryPages(checkedEntry, 16, MEM_PROT_READ | MEM_PROT_WRITE);
 	}
 
@@ -482,7 +491,7 @@ void Arm64Jit::UnlinkBlock(u8 *checkedEntry, u32 originalAddress) {
 	emit.B(MIPSComp::jit->GetDispatcher());
 	emit.FlushIcache();
 
-	if (PlatformIsWXExclusive()) {
+	if (PlatformIsWXExclusive() && !PlatformIsDualMappedJIT()) {
 		ProtectMemoryPages(checkedEntry, 16, MEM_PROT_READ | MEM_PROT_EXEC);
 	}
 }

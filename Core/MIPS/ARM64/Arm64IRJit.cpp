@@ -217,7 +217,7 @@ void Arm64JitBackend::OverwriteExit(int srcOffset, int len, int block_num) {
 	const IRNativeBlock *nativeBlock = GetNativeBlock(block_num);
 	if (nativeBlock) {
 		u8 *writable = GetWritablePtrFromCodePtr(GetBasePtr()) + srcOffset;
-		if (PlatformIsWXExclusive()) {
+		if (PlatformIsWXExclusive() && !PlatformIsDualMappedJIT()) {
 			ProtectMemoryPages(writable, len, MEM_PROT_READ | MEM_PROT_WRITE);
 		}
 
@@ -229,7 +229,7 @@ void Arm64JitBackend::OverwriteExit(int srcOffset, int len, int block_num) {
 			emitter.ReserveCodeSpace(len - bytesWritten);
 		emitter.FlushIcache();
 
-		if (PlatformIsWXExclusive()) {
+		if (PlatformIsWXExclusive() && !PlatformIsDualMappedJIT()) {
 			ProtectMemoryPages(writable, 16, MEM_PROT_READ | MEM_PROT_EXEC);
 		}
 	}
@@ -318,8 +318,14 @@ bool Arm64JitBackend::DescribeCodePtr(const u8 *ptr, std::string &name) const {
 }
 
 void Arm64JitBackend::ClearAllBlocks() {
+	// Only flush the part of the space that was actually used since the last clear -
+	// the rest still holds already-flushed poison.
+	int usedEnd = (int)GetUsedCodeSpace();
+	if (usedEnd < jitStartOffset_ || usedEnd > (int)region_size) {
+		usedEnd = (int)region_size;
+	}
 	ClearCodeSpace(jitStartOffset_);
-	FlushIcacheSection(region + jitStartOffset_, region + region_size - jitStartOffset_);
+	FlushIcacheSection(region + jitStartOffset_, region + usedEnd - jitStartOffset_);
 	EraseAllLinks(-1);
 }
 
@@ -332,7 +338,7 @@ void Arm64JitBackend::InvalidateBlock(IRBlockCache *irBlockCache, int block_num)
 	u32 pc = block->GetOriginalStart();
 	if (pc != 0) {
 		// Hopefully we always have at least 16 bytes, which should be all we need.
-		if (PlatformIsWXExclusive()) {
+		if (PlatformIsWXExclusive() && !PlatformIsDualMappedJIT()) {
 			ProtectMemoryPages(writable, MIN_BLOCK_NORMAL_LEN, MEM_PROT_READ | MEM_PROT_WRITE);
 		}
 
@@ -344,7 +350,7 @@ void Arm64JitBackend::InvalidateBlock(IRBlockCache *irBlockCache, int block_num)
 			emitter.ReserveCodeSpace(MIN_BLOCK_NORMAL_LEN - bytesWritten);
 		emitter.FlushIcache();
 
-		if (PlatformIsWXExclusive()) {
+		if (PlatformIsWXExclusive() && !PlatformIsDualMappedJIT()) {
 			ProtectMemoryPages(writable, MIN_BLOCK_NORMAL_LEN, MEM_PROT_READ | MEM_PROT_EXEC);
 		}
 	}
