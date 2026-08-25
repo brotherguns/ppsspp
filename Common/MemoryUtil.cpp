@@ -47,6 +47,7 @@
 #endif
 
 #if PPSSPP_HAS_DEBUGGER_ASSISTED_JIT
+#include <atomic>
 #include <csignal>
 #include <mutex>
 #include <vector>
@@ -264,13 +265,18 @@ struct DualMappedJITRange {
 
 static std::vector<DualMappedJITRange> dualMappedRanges;
 static std::mutex dualMappedMutex;
+// Lock-free fast path so ProtectMemoryPages() (called per JIT block) can skip the mutex
+// entirely when no debugger-assisted allocations are active.
+static std::atomic<bool> hasDualMappedRanges{false};
 
 bool PlatformIsDualMappedJIT() {
-	std::lock_guard<std::mutex> guard(dualMappedMutex);
-	return !dualMappedRanges.empty();
+	return hasDualMappedRanges.load(std::memory_order_acquire);
 }
 
 static bool InDualMappedJITRange(uintptr_t addr) {
+	if (!PlatformIsDualMappedJIT()) {
+		return false;
+	}
 	std::lock_guard<std::mutex> guard(dualMappedMutex);
 	for (const DualMappedJITRange &range : dualMappedRanges) {
 		if ((addr >= range.execStart && addr < range.execStart + range.size) ||
@@ -295,7 +301,7 @@ void *AllocateDualMappedExecutableMemory(size_t size, void **writablePtr) {
 
 	uintptr_t exec = (uintptr_t)IOS26JITPrepareRegion(nullptr, size);
 	if (exec == 0) {
-		WARN_LOG(Log::JIT, "Debugger-assisted JIT: no JIT-enabler debugger attached, allocation of %d bytes failed", (int)size);
+		WARN_LOG(Log::JIT, "Debugger-assisted JIT: no JIT-enabler debugger attached, falling back to regular allocation for %d bytes", (int)size);
 		return nullptr;
 	}
 
@@ -319,6 +325,7 @@ void *AllocateDualMappedExecutableMemory(size_t size, void **writablePtr) {
 	{
 		std::lock_guard<std::mutex> guard(dualMappedMutex);
 		dualMappedRanges.push_back({exec, (uintptr_t)writeAddr, size});
+		hasDualMappedRanges.store(true, std::memory_order_release);
 	}
 
 	INFO_LOG(Log::JIT, "Debugger-assisted JIT: allocated %d bytes, exec at %p, writable at %p",
@@ -344,6 +351,7 @@ void FreeDualMappedExecutableMemory(void *ptr, void *writablePtr, size_t size) {
 				break;
 			}
 		}
+		hasDualMappedRanges.store(!dualMappedRanges.empty(), std::memory_order_release);
 	}
 
 	vm_deallocate(mach_task_self(), (vm_address_t)ptr, size);
