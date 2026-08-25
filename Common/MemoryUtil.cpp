@@ -343,6 +343,9 @@ void FreeDualMappedExecutableMemory(void *ptr, void *writablePtr, size_t size) {
 	const size_t jitPageSize = 16384;
 	size = (size + jitPageSize - 1) & ~(jitPageSize - 1);
 
+	INFO_LOG(Log::JIT, "Debugger-assisted JIT: freeing %d bytes, exec at %p, writable at %p",
+		(int)size, ptr, writablePtr);
+
 	{
 		std::lock_guard<std::mutex> guard(dualMappedMutex);
 		for (size_t i = 0; i < dualMappedRanges.size(); i++) {
@@ -506,6 +509,16 @@ bool ProtectMemoryPages(const void* ptr, size_t size, uint32_t memProtFlags) {
 	// through the writable alias and execution through the executable mapping, so there's
 	// nothing to change here.
 	if (InDualMappedJITRange(start)) {
+		return true;
+	}
+	// All other ProtectMemoryPages callers target JIT code space. If debugger-assisted JIT is
+	// active but the address belongs to none of its mappings, this is a stale or corrupt
+	// pointer - mprotecting it would either fail noisily or corrupt an unrelated mapping,
+	// so ignore it instead.
+	if (PlatformIsWXExclusive() && PlatformIsDualMappedJIT()) {
+		WARN_LOG(Log::JIT, "ProtectMemoryPages on unowned address %p (%d bytes, r%d w%d x%d) while debugger-assisted JIT is active - ignoring",
+			ptr, (int)size,
+			(memProtFlags & MEM_PROT_READ) != 0, (memProtFlags & MEM_PROT_WRITE) != 0, (memProtFlags & MEM_PROT_EXEC) != 0);
 		return true;
 	}
 #endif
