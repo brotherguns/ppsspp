@@ -240,6 +240,15 @@ __attribute__((naked)) static void *IOS26JITPrepareRegion(void *addr, size_t len
 		"ret\n");
 }
 
+// Asks the attached debugger to detach; StikDebug's universal.js exits its loop when it
+// receives this.
+__attribute__((naked)) static void IOS26JITDetach() {
+	__asm__ volatile(
+		"mov x16, #0\n"
+		"brk #0xf00d\n"
+		"ret\n");
+}
+
 // If no debugger is attached to service the breakpoint, SIGTRAP would kill the process.
 // Skip past the brk and make the "syscall" return zero so callers can fall back.
 static void IOS26JITTrapHandler(int signum, siginfo_t *info, void *context) {
