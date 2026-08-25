@@ -50,6 +50,7 @@
 #include <atomic>
 #include <csignal>
 #include <mutex>
+#include <thread>
 #include <vector>
 #endif
 static int hint_location;
@@ -257,6 +258,41 @@ void InstallDebuggerAssistedJITTrapHandler() {
 	sigaction(SIGTRAP, &sa, nullptr);
 }
 
+// The JIT enabler only needs to stay attached while executable memory is being handed out -
+// every allocation is a debugger round trip, and once the JIT buffers exist, the breakpoint
+// "syscalls" are never used again. Meanwhile, a permanently attached debugserver stays in the
+// process's exception/signal path, which can add latency and stall the emulator at arbitrary
+// points. So after allocations have settled for a while, ask the debugger to detach
+// (the x16 = 0 syscall - StikDebug's universal.js exits cleanly when it receives it).
+//
+// If more executable memory is needed later (e.g. starting another game), the allocation
+// fails gracefully and falls back to the classic path; simply re-attach the enabler first.
+static std::atomic<int> dualMappedAllocEpoch{0};
+static std::atomic<bool> jitDebuggerDetached{false};
+
+static void IOS26JITDetachWatchdog() {
+	// Set PPSSPP_NO_JIT_DETACH=1 to keep the JIT enabler attached indefinitely.
+	if (getenv("PPSSPP_NO_JIT_DETACH") != nullptr) {
+		return;
+	}
+	int lastEpoch = dualMappedAllocEpoch.load(std::memory_order_acquire);
+	for (;;) {
+		sleep(5);
+		const int epoch = dualMappedAllocEpoch.load(std::memory_order_acquire);
+		if (epoch == lastEpoch) {
+			break;
+		}
+		lastEpoch = epoch;
+	}
+
+	bool expected = false;
+	if (!jitDebuggerDetached.compare_exchange_strong(expected, true)) {
+		return;
+	}
+	INFO_LOG(Log::JIT, "Debugger-assisted JIT: allocations settled, detaching JIT-enabler debugger");
+	IOS26JITDetach();
+}
+
 struct DualMappedJITRange {
 	uintptr_t execStart;
 	uintptr_t writeStart;
@@ -332,6 +368,15 @@ void *AllocateDualMappedExecutableMemory(size_t size, void **writablePtr) {
 		(int)size, (void *)exec, (void *)writeAddr);
 
 	*writablePtr = (void *)writeAddr;
+
+	// Kick (or start) the watchdog that detaches the JIT-enabler debugger once
+	// allocations have settled.
+	dualMappedAllocEpoch.fetch_add(1, std::memory_order_acq_rel);
+	static std::once_flag watchdogOnce;
+	std::call_once(watchdogOnce, [] {
+		std::thread(IOS26JITDetachWatchdog).detach();
+	});
+
 	return (void *)exec;
 }
 
