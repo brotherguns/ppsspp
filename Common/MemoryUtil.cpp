@@ -274,10 +274,13 @@ void InstallDebuggerAssistedJITTrapHandler() {
 // points. So after allocations have settled for a while, ask the debugger to detach
 // (the x16 = 0 syscall - StikDebug's universal.js exits cleanly when it receives it).
 //
-// If more executable memory is needed later (e.g. starting another game), the allocation
-// fails gracefully and falls back to the classic path; simply re-attach the enabler first.
+// Only real allocations count towards "settled" - the startup availability probe must not,
+// or the debugger would get detached while the user is still in the menu, before the game
+// has booted and made its actual JIT allocations.
 static std::atomic<int> dualMappedAllocEpoch{0};
 static std::atomic<bool> jitDebuggerDetached{false};
+
+static constexpr int JIT_DETACH_IDLE_POLLS = 4;  // x 5s sleeps = 20s of allocation silence
 
 static void IOS26JITDetachWatchdog() {
 	// Set PPSSPP_NO_JIT_DETACH=1 to keep the JIT enabler attached indefinitely.
@@ -285,13 +288,19 @@ static void IOS26JITDetachWatchdog() {
 		return;
 	}
 	int lastEpoch = dualMappedAllocEpoch.load(std::memory_order_acquire);
+	int stablePolls = 0;
 	for (;;) {
 		sleep(5);
 		const int epoch = dualMappedAllocEpoch.load(std::memory_order_acquire);
 		if (epoch == lastEpoch) {
-			break;
+			stablePolls++;
+			if (stablePolls >= JIT_DETACH_IDLE_POLLS) {
+				break;
+			}
+		} else {
+			lastEpoch = epoch;
+			stablePolls = 0;
 		}
-		lastEpoch = epoch;
 	}
 
 	bool expected = false;
@@ -332,7 +341,7 @@ static bool InDualMappedJITRange(uintptr_t addr) {
 	return false;
 }
 
-void *AllocateDualMappedExecutableMemory(size_t size, void **writablePtr) {
+static void *AllocateDualMappedInternal(size_t size, void **writablePtr, bool countForWatchdog) {
 	*writablePtr = nullptr;
 
 	static std::once_flag installOnce;
@@ -379,14 +388,31 @@ void *AllocateDualMappedExecutableMemory(size_t size, void **writablePtr) {
 	*writablePtr = (void *)writeAddr;
 
 	// Kick (or start) the watchdog that detaches the JIT-enabler debugger once
-	// allocations have settled.
-	dualMappedAllocEpoch.fetch_add(1, std::memory_order_acq_rel);
-	static std::once_flag watchdogOnce;
-	std::call_once(watchdogOnce, [] {
-		std::thread(IOS26JITDetachWatchdog).detach();
-	});
+	// allocations have settled. The availability probe passes countForWatchdog = false,
+	// so it can't trick the watchdog into detaching before the game has booted.
+	if (countForWatchdog) {
+		dualMappedAllocEpoch.fetch_add(1, std::memory_order_acq_rel);
+		static std::once_flag watchdogOnce;
+		std::call_once(watchdogOnce, [] {
+			std::thread(IOS26JITDetachWatchdog).detach();
+		});
+	}
 
 	return (void *)exec;
+}
+
+void *AllocateDualMappedExecutableMemory(size_t size, void **writablePtr) {
+	return AllocateDualMappedInternal(size, writablePtr, true);
+}
+
+bool ProbeDebuggerAssistedJIT() {
+	void *writable = nullptr;
+	void *exec = AllocateDualMappedInternal(64 * 1024, &writable, false);
+	if (exec) {
+		FreeDualMappedExecutableMemory(exec, writable, 64 * 1024);
+		return true;
+	}
+	return false;
 }
 
 void FreeDualMappedExecutableMemory(void *ptr, void *writablePtr, size_t size) {
@@ -420,6 +446,10 @@ void FreeDualMappedExecutableMemory(void *ptr, void *writablePtr, size_t size) {
 #else  // !PPSSPP_HAS_DEBUGGER_ASSISTED_JIT
 
 bool PlatformIsDualMappedJIT() {
+	return false;
+}
+
+bool ProbeDebuggerAssistedJIT() {
 	return false;
 }
 
@@ -579,6 +609,11 @@ bool ProtectMemoryPages(const void* ptr, size_t size, uint32_t memProtFlags) {
 	int retval = mprotect((void *)start, end - start, protect);
 	if (retval != 0) {
 		ERROR_LOG(Log::MemMap, "mprotect failed (%p)! errno=%d (%s)", (void *)start, errno, strerror(errno));
+#if PPSSPP_HAS_DEBUGGER_ASSISTED_JIT
+		if (PlatformIsWXExclusive() && (protect & PROT_EXEC) != 0) {
+			ERROR_LOG(Log::JIT, "Generated code cannot be made executable - on iOS 26, attach StikDebug/StikJIT BEFORE starting a game, then load the game again");
+		}
+#endif
 		return false;
 	}
 	return true;

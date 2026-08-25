@@ -61,6 +61,11 @@ void FreeDualMappedExecutableMemory(void *ptr, void *writablePtr, size_t size);
 // True while any debugger-assisted dual-mapped JIT memory is active.
 bool PlatformIsDualMappedJIT();
 
+// Checks whether a JIT-enabler debugger is currently attached and able to serve executable
+// memory, by allocating and immediately freeing a small probe region. Never starts the
+// auto-detach watchdog. Returns true when available.
+bool ProbeDebuggerAssistedJIT();
+
 // Makes the brk-based "syscalls" safe when no debugger is attached: the resulting SIGTRAP
 // is caught, skipped past, and treated as a failed allocation instead of a crash.
 // Call early at startup on iOS. Does nothing on unsupported platforms.

@@ -719,16 +719,24 @@ int main(int argc, char *argv[]) {
 	// On iOS 26 TXM devices, check whether a JIT-enabler debugger (StikDebug/StikJIT with
 	// universal.js, JitStreamer EB, etc.) is currently attached and able to serve us
 	// executable memory. If so, the JITs will use debugger-assisted dual-mapped JIT memory.
-	{
-		void *probeWritable = nullptr;
-		void *probeExec = AllocateDualMappedExecutableMemory(64 * 1024, &probeWritable);
-		if (probeExec) {
-			INFO_LOG(Log::System, "JIT: debugger-assisted dual-mapped JIT available (exec %p, writable %p)", probeExec, probeWritable);
-			g_jitAvailable = true;
-			FreeDualMappedExecutableMemory(probeExec, probeWritable, 64 * 1024);
-		} else {
-			INFO_LOG(Log::System, "JIT: debugger-assisted dual-mapped JIT unavailable - attach StikDebug/StikJIT to this app before starting a game to enable it on iOS 26");
+	//
+	// NOTE: This probe deliberately does not count towards the auto-detach watchdog.
+	if (!ProbeDebuggerAssistedJIT()) {
+		INFO_LOG(Log::System, "JIT: debugger-assisted dual-mapped JIT unavailable - attach StikDebug/StikJIT to this app before starting a game to enable it on iOS 26");
+		// If none of the classic JIT paths are available either, this build cannot execute
+		// generated code at all right now. Nudge the user towards their JIT enabler; it only
+		// needs to be attached until the game's JIT buffers have been allocated.
+		if (!jb_has_jit_entitlement() && !jb_has_cs_disabled() && !jb_has_cs_execseg_allow_unsigned()) {
+			NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+			NSString *urlString = [NSString stringWithFormat:@"stikjit://enable-jit?bundle-id=%@", bundleID];
+			NSURL *url = [NSURL URLWithString:urlString];
+			dispatch_async(dispatch_get_main_queue(), ^{
+				[[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+			});
 		}
+	} else {
+		INFO_LOG(Log::System, "JIT: debugger-assisted dual-mapped JIT available");
+		g_jitAvailable = true;
 	}
 #endif
 
